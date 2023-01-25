@@ -1,0 +1,5 @@
+/target
+*.parquet
+*.csv
+*.png
+*.tif
