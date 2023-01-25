@@ -1,10 +1,11 @@
-use anyhow::Result;
-use arrow_array::{ArrayRef, Float32Array, Int32Array, RecordBatch};
+use anyhow::{Result, bail};
+use arrow_array::{ArrayRef, Float32Array, RecordBatch};
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressIterator, ProgressStyle};
 use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
+use zip::ZipArchive;
 use std::{
-    collections::HashMap, fs::File, path::PathBuf, str::FromStr, sync::Arc,
+    collections::HashMap, fs::File, path::{PathBuf, Path}, sync::Arc, io::{Read, Cursor},
 };
 use tiff::decoder::{DecodingResult, Limits};
 
@@ -15,75 +16,71 @@ struct Cli {
     output_path: Option<PathBuf>,
     #[arg(long = "group")]
     group: Option<f64>,
-    #[arg(long = "drop-below", default_value = "1")]
-    drop_below: i32,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    process_one(cli.input_path, cli.output_path, cli.group)?;
 
-    println!("Loading file");
-    let path = PathBuf::from_str("./ShipDensity_Passenger1.tif")?;
-    let file = File::open(path)?;
-    let mut decoder = tiff::decoder::Decoder::new(file)?.with_limits(Limits::unlimited());
+    Ok(())
+}
+
+fn process_one(input_path: PathBuf, output_path: Option<PathBuf>, group: Option<f64>) -> Result<()> {
+    let tif_contents = load_tif_contents(input_path.as_path())?;
+
+    println!("decoding tif");
+    let mut decoder = tiff::decoder::Decoder::new(Cursor::new(tif_contents))?.with_limits(Limits::unlimited());
     let (width, height) = decoder.dimensions()?;
     let image = decoder.read_image()?;
 
     if let DecodingResult::I32(pixels) = image {
-        println!("reading pixels");
+        println!("processing image");
         let pixel_count = width as u64 * height as u64;
         let progress_bar = ProgressBar::new(pixel_count)
             .with_style(ProgressStyle::with_template("{bar} {percent}% - {elapsed_precise}")?);
-        let data = pixels
+        let mut data: Vec<(f64, f64, f64)> = pixels
             .into_iter()
             .progress_with(progress_bar)
             .enumerate()
-            .filter(|(_, value)| *value >= cli.drop_below)
+            .filter(|(_, value)| *value > 0)
             .map(|(idx, value)| (idx % width as usize, idx / width as usize, value))
-            .collect::<Vec<_>>();
-
-        println!("converting data");
-        let mut data: Vec<(f64, f64, i32)> = data
-            .into_iter()
             .map(|(x, y, value)| {
-                let lat = lerp(x as f64, (0.0, width as f64), (-180.0, 180.0));
-                let lon = lerp(y as f64, (0.0, height as f64), (85.0, -85.0));
-                (lat, lon, value)
+                let lon = lerp(x as f64, (0.0, width as f64), (-180.0, 180.0));
+                let lat = lerp(y as f64, (0.0, height as f64), (85.0, -85.0));
+                (lon, lat, value as f64)
             })
             .collect();
 
-        if let Some(group) = cli.group {
-            println!("grouping data");
-            let mut grouped = HashMap::<(i32, i32), (f64, f64, i32)>::new();
-            for (lat, lon, value) in data.iter() {
-                let lat_index = (lat / group).floor() as i32;
+        if let Some(group) = group {
+            let mut grouped = HashMap::<(i32, i32), (f64, f64, f64)>::new();
+            for (lon, lat, value) in data.iter() {
                 let lon_index = (lon / group).floor() as i32;
-                let grouped_lat = lat_index as f64 * group;
+                let lat_index = (lat / group).floor() as i32;
                 let grouped_lon = lon_index as f64 * group;
+                let grouped_lat = lat_index as f64 * group;
                 let entry =
                     grouped
-                        .entry((lat_index, lon_index))
-                        .or_insert((grouped_lat, grouped_lon, 0));
-                entry.2 += value;
+                        .entry((lon_index, lat_index))
+                        .or_insert((grouped_lon, grouped_lat, 0.0));
+                let scaled = *value * lat.cos();
+                entry.2 += scaled;
             }
             data = grouped.into_values().collect();
         }
 
-        println!("writing parquet");
-        let output_path = cli
-            .output_path
-            .unwrap_or_else(|| cli.input_path.with_extension("parquet"));
+        let output_path = output_path
+            .unwrap_or_else(|| input_path.with_extension("parquet"));
 
         let props = WriterProperties::builder().build();
         let file = File::create(&output_path)?;
 
-        let lat_col = Float32Array::from_iter(data.iter().map(|r| r.0 as f32));
         let lon_col = Float32Array::from_iter(data.iter().map(|r| r.1 as f32));
-        let value_col = Int32Array::from_iter(data.iter().map(|r| r.2));
+        let lat_col = Float32Array::from_iter(data.iter().map(|r| r.0 as f32));
+        let value_col = Float32Array::from_iter(data.iter().map(|r| r.2 as f32));
 
         let batch = RecordBatch::try_from_iter(vec![
-            ("lat", Arc::new(lat_col) as ArrayRef),
             ("lon", Arc::new(lon_col) as ArrayRef),
+            ("lat", Arc::new(lat_col) as ArrayRef),
             ("value", Arc::new(value_col) as ArrayRef),
         ])?;
 
@@ -109,6 +106,26 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn load_tif_contents(path: &Path) -> Result<Vec<u8>> {
+    let mut tif_contents: Vec<u8> = vec![];
+    match path.extension().and_then(|e| e.to_str()) {
+        Some(ext) if ext == "zip" => {
+            let zip_file = File::open(path)?;
+            let mut archive = ZipArchive::new(zip_file)?;
+            let tif_names = archive.file_names().filter(|n| n.ends_with(".tif")|| n.ends_with(".tiff")).map(|n| n.to_string()).collect::<Vec<_>>();
+            match &tif_names[..] {
+                [] => bail!("No tif files found archive"),
+                [tif_name] => archive.by_name(tif_name)?.read_to_end(&mut tif_contents)?,
+                _ => bail!("Multiple tif files found in archive"),
+            }
+        }
+        Some(ext) if ext == "tif" => File::open(path)?.read_to_end(&mut tif_contents)?,
+        Some(ext) => bail!("Unexpected file extension {}", ext),
+        None => bail!("No file extension on {}", path.to_string_lossy()),
+    };
+    Ok(tif_contents)
 }
 
 fn lerp(v: f64, domain: (f64, f64), range: (f64, f64)) -> f64 {
