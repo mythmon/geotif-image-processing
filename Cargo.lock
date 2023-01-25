@@ -630,7 +630,6 @@ dependencies = [
  "image",
  "indicatif",
  "parquet",
- "rayon",
  "tiff",
  "zip",
 ]

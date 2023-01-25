@@ -1,46 +1,59 @@
-use anyhow::{Result, bail};
+#[allow(unused_imports)]
+use anyhow::{anyhow, bail, Result};
 use arrow_array::{ArrayRef, Float32Array, RecordBatch};
 use clap::Parser;
-use indicatif::{ProgressBar, ProgressIterator, ProgressStyle};
-use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
-use zip::ZipArchive;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle, ProgressIterator};
+use parquet::arrow::ArrowWriter;
 use std::{
-    collections::HashMap, fs::File, path::{PathBuf, Path}, sync::Arc, io::{Read, Cursor},
+    collections::HashMap,
+    fs::File,
+    io::{Cursor, Read},
+    path::{Path, PathBuf},
+    sync::Arc,
 };
 use tiff::decoder::{DecodingResult, Limits};
+use zip::ZipArchive;
 
 #[derive(Parser)]
 struct Cli {
-    input_path: PathBuf,
-    #[arg(short = 'o', long = "output")]
-    output_path: Option<PathBuf>,
+    input_path: Vec<PathBuf>,
     #[arg(long = "group")]
     group: Option<f64>,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    process_one(cli.input_path, cli.output_path, cli.group)?;
-
+    let multi_bar = MultiProgress::new();
+    cli.input_path
+        .into_iter()
+        .map(|input_path| process_one(multi_bar.clone(), input_path, cli.group))
+        .collect::<Result<Vec<_>>>()?;
     Ok(())
 }
 
-fn process_one(input_path: PathBuf, output_path: Option<PathBuf>, group: Option<f64>) -> Result<()> {
+fn process_one(multi_bar: MultiProgress, input_path: PathBuf, group: Option<f64>) -> Result<()> {
+    let bar = multi_bar.add(ProgressBar::new_spinner());
+    bar.set_style(ProgressStyle::with_template("{prefix:<30} {msg}")?);
+    bar.set_prefix(input_path.to_string_lossy().to_string());
+    bar.set_message("reading file");
     let tif_contents = load_tif_contents(input_path.as_path())?;
 
-    println!("decoding tif");
-    let mut decoder = tiff::decoder::Decoder::new(Cursor::new(tif_contents))?.with_limits(Limits::unlimited());
+    bar.set_message("decoding tif");
+    let mut decoder =
+        tiff::decoder::Decoder::new(Cursor::new(tif_contents))?.with_limits(Limits::unlimited());
     let (width, height) = decoder.dimensions()?;
     let image = decoder.read_image()?;
 
     if let DecodingResult::I32(pixels) = image {
-        println!("processing image");
-        let pixel_count = width as u64 * height as u64;
-        let progress_bar = ProgressBar::new(pixel_count)
-            .with_style(ProgressStyle::with_template("{bar} {percent}% - {elapsed_precise}")?);
+        bar.set_message("processing image");
+        bar.set_length(width as u64 * height as u64);
+        bar.set_style(ProgressStyle::with_template(
+            "{prefix:<30} {msg} {percent}% {elapsed_precise} {bar_wide}",
+        )?);
+
         let mut data: Vec<(f64, f64, f64)> = pixels
             .into_iter()
-            .progress_with(progress_bar)
+            .progress_with(bar.clone())
             .enumerate()
             .filter(|(_, value)| *value > 0)
             .map(|(idx, value)| (idx % width as usize, idx / width as usize, value))
@@ -58,21 +71,16 @@ fn process_one(input_path: PathBuf, output_path: Option<PathBuf>, group: Option<
                 let lat_index = (lat / group).floor() as i32;
                 let grouped_lon = lon_index as f64 * group;
                 let grouped_lat = lat_index as f64 * group;
-                let entry =
-                    grouped
-                        .entry((lon_index, lat_index))
-                        .or_insert((grouped_lon, grouped_lat, 0.0));
-                let scaled = *value * lat.cos();
+                let entry = grouped.entry((lon_index, lat_index)).or_insert((
+                    grouped_lon,
+                    grouped_lat,
+                    0.0,
+                ));
+                let scaled = *value * lat.to_radians().cos();
                 entry.2 += scaled;
             }
             data = grouped.into_values().collect();
         }
-
-        let output_path = output_path
-            .unwrap_or_else(|| input_path.with_extension("parquet"));
-
-        let props = WriterProperties::builder().build();
-        let file = File::create(&output_path)?;
 
         let lon_col = Float32Array::from_iter(data.iter().map(|r| r.1 as f32));
         let lat_col = Float32Array::from_iter(data.iter().map(|r| r.0 as f32));
@@ -84,10 +92,10 @@ fn process_one(input_path: PathBuf, output_path: Option<PathBuf>, group: Option<
             ("value", Arc::new(value_col) as ArrayRef),
         ])?;
 
-        let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props))?;
+        let output_file = File::create(&input_path.with_extension("parquet"))?;
+        let mut writer = ArrowWriter::try_new(output_file, batch.schema(), None)?;
         writer.write(&batch)?;
         writer.close()?;
-        println!("done");
     } else {
         let image_type = match &image {
             DecodingResult::U8(_) => "U8",
@@ -105,6 +113,7 @@ fn process_one(input_path: PathBuf, output_path: Option<PathBuf>, group: Option<
         anyhow::bail!("Unexpected image type. Expected I32 but got {}", image_type);
     }
 
+    bar.finish_with_message("done");
     Ok(())
 }
 
@@ -114,7 +123,11 @@ fn load_tif_contents(path: &Path) -> Result<Vec<u8>> {
         Some(ext) if ext == "zip" => {
             let zip_file = File::open(path)?;
             let mut archive = ZipArchive::new(zip_file)?;
-            let tif_names = archive.file_names().filter(|n| n.ends_with(".tif")|| n.ends_with(".tiff")).map(|n| n.to_string()).collect::<Vec<_>>();
+            let tif_names = archive
+                .file_names()
+                .filter(|n| n.ends_with(".tif") || n.ends_with(".tiff"))
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>();
             match &tif_names[..] {
                 [] => bail!("No tif files found archive"),
                 [tif_name] => archive.by_name(tif_name)?.read_to_end(&mut tif_contents)?,
@@ -137,7 +150,12 @@ mod tests {
     use crate::lerp;
 
     fn assert_approx(actual: f64, expected: f64) {
-        assert!((expected - actual).abs() < 0.001, "{} should be approximately to {}", actual, expected);
+        assert!(
+            (expected - actual).abs() < 0.001,
+            "{} should be approximately to {}",
+            actual,
+            expected
+        );
     }
 
     #[test]
